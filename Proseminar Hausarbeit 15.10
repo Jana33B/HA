@@ -1,0 +1,388 @@
+```{r}
+ibrary(RPostgres)
+library(stringr)
+library(dplyr)
+
+
+import_data <- function(){
+  # Importiert alle Texte (google und Wiso) aus der
+  # PostgreSQL Datenbank und merged die DatensÃ¤tze
+  library(DBI)
+  library(RPostgres)
+  
+  con <- dbConnect(Postgres(),dbname = 'testpscss', 
+                   host = '193.196.54.88',
+                   port = 1235,
+                   user = 'testpscss',
+                   password = "P*ass*css")
+  
+  dbListTables(con)
+  
+  gebietseinheit <- dbReadTable(con, "gebietseinheit")
+  gebietseinheit <- gebietseinheit[gebietseinheit$land=="08",] #08=BW
+  
+  corpus <- dbReadTable(con, "google_parsed")
+  corpus2 <- dbReadTable(con, "wiso_parsed")
+  corpus <- bind_rows(corpus, corpus2)
+  df <- corpus %>% mutate(domain = case_when(is.na(domain) ~ wiso_code,
+                                                 TRUE ~ domain))
+  #con <- dbConnect(Postgres(),dbname = 'testpscss', 
+   #                host = '193.196.54.88',
+    #               port = 1235,
+     #              user = 'testpscss',
+      #             password = "P*ass*css")
+  #dfg = dbReadTable(con, "google_parsed")
+  #dfw = dbReadTable(con, "wiso_parsed")
+ 
+  
+
+  return(df)
+}
+
+
+datum_auslesen <- function(text){
+  # Manche Datumsformate nutzen Punkt, diese muessen 
+  # durch Strich erstezen, dann als Datum ausgeben
+  # unique(substr(df$temp_date, 4,4))
+  temp = substr(text, 1,10)
+  temp = gsub(".", "-", temp, fixed=T)
+  #unique(substr(df$temp_date, 4,4))
+  date = as.Date(temp)
+  return(date)
+}
+
+text_preprocessing <- function(text){
+  # Da die Analysebene auf Satzebene liegt, mÃ¼ssen alle Artikel in 
+  # Saetze zerlegt werden. Dies geschieht an der Punktierung. 
+  # Dabei kann aber ein Punkt z.B. nach 2. die Trennung verwirren.
+  # Aus 2. soll also 2te werden:
+  temp = gsub("(?<=\\b[0-9]|\\b[0-9]{2})\\.\\s", "te ", text, perl = TRUE)
+  
+  # Ggf. ergÃ¤nzen, wenn weitere Vorbereitende Schritte notwendig sind
+  
+  return(temp)
+}
+
+parteibezeichnungen_normalisieren <- function(text, dictionnaire){
+  # DiktionÃ¤r von Parteien als Liste
+  for(i in c(1:length(dictionnaire))){
+    text <- gsub(paste(dictionnaire[[i]],
+                       collapse = "|"),
+                 names(dictionnaire)[i],
+                 text,
+                 ignore.case = TRUE)
+  }
+  return(text)
+}
+
+
+###
+
+# Nun den Corpus auf Satzebene erstellen:
+cps <- corpus_reshape(cp, 
+                      to = c("sentences"), 
+                      use_docvars = TRUE)
+
+
+parteinennungen_zuspielen <- function(cps, dictionnaire){
+  count_mentions <- function(cps, dictionnaire){
+    # Sucht nach Parteien in  SÃ¤tzen und zÃ¤hlt wie hÃ¤ufig. 
+    # Gibt Counts in Vektor der LÃ¤nge Anzahl pattern zurÃ¼ck 
+    occurance <- matrix(NA,
+                        nrow = length(unlist(cps)),
+                        ncol = length(dictionnaire))
+    for(i in c(1:length(dictionnaire))){
+      occurance[,i] <- stringr::str_count(cps, names(dictionnaire)[i])
+    }
+    return(occurance)
+  }
+  
+  parteinennungen <- count_mentions(cps, dictionnaire)
+  
+  parteinennungen <- as.data.frame(parteinennungen)
+  names(parteinennungen) <- names(dictionnaire)
+  for(d in names(dictionnaire)){
+    docvars(cps, d) <- parteinennungen[,d]
+  }
+  #docvars(cps) <- parteinennungen
+  return(cps)
+}
+
+# Mit diesem Befehl werden die Funktionen eingelesen
+#source("./funktionen.R")
+
+
+# Daten einelsen aus Datenbank
+df <- import_data()
+
+# Datumsvariable ertstellen (Datum der Publikation)
+df$pub_datum <- datum_auslesen(df$parsed_text)
+
+
+# Kleinere Vorabreiten
+# Hinweis: Texte werden nicht in Kleinschreibung umgewandelt, da 
+# sonst die Zerlegung in einzelne SÃ¤tze nicht korrekt funktioniert (dabei
+# wird auf GroÃ/Kleinschreibung nach der Punktion geachtet).
+df$preprocessed_text <- text_preprocessing(df$parsed_text)
+
+
+# Parteinamen mit DiktionÃ¤r vereinheitlichen
+
+dparteien <- list(SPD = c("spd", "sozialdemokrat\\w*", "sozen"),
+                  CDU = c("cdu\\w*", "christdemokrat\\w*", "union\\w*", "csu\\w*", "christsozial\\w*"),
+                  Grüne = c("bÃ¼ndnis 90","bÃ¼ndnis90", "grÃ¼ne\\w*"),
+                  Linke = c("linke\\w*"),
+                  AFD = c("afd\\w*", "blaue\\w*"),
+                  FDP = c("fdp\\w*", "liberale\\w*"),
+                  PIRATEN = c("piraten\\w*", "seeräuber"),
+                  NPD = c("npd\\w*"),
+                  DiePartei = c("die partei\\w*"),
+                  ÖDP = c("Ödp\\w*"))
+
+
+
+df$preprocessed_text <- parteibezeichnungen_normalisieren(df$preprocessed_text, dparteien)
+
+
+# Dann quanteda Corpus erstellen
+library(quanteda)
+cp = corpus(df$preprocessed_text)
+# Die docvars sind ein dataframe, der als Metainformation dem Corpus 
+# angehÃ¤ngt wird. zeilenweise die Dokumente, spaltenweise Variablen 
+docvars(cp) <- df[,c("ortsname", "RS", "pub_datum")]
+
+# Nun den Corpus auf Satzebene erstellen:
+cps <- corpus_reshape(cp, 
+                      to = c("sentences"), 
+                      use_docvars = TRUE)
+# Und fÃ¼r jeden Satz als docvar zuspielen, welche 
+# Parteien im Satz genannt werden
+cps <- parteinennungen_zuspielen(cps, dparteien)
+docvars(cps)
+
+# Die Parteien aus den docvars kÃ¶nnen jetzt als unabhÃ¤ngige Dummy-Variable genutzt werden, 
+# die einen Einfluss auf das Sentiment haben.
+
+# SÃ¤tze zu Windkraft, in denen CDU azftaucht z.B. negativer 
+# SÃ¤tze zu Windkraft, in denen GrÃ¼ne auftacuhen z.B: positiver
+
+suchvektor <- c( "Anwaltsplanung", "Arbeitsgruppen", "Arbeitskreis", "Arbeitsgruppe", "Auftakt-Veranstaltung", "Auftaktveranstaltung", "Beteiligung", "Beteiligungsverfahren", "Bürgerbeteiligung", "Beteiligungsangebot", "beteiligungsorientiert", "Beteiligungsbeirat", "Bürgerbeirat", "Bürgerdialog", "Bürger-Dialog", "Bürgercafe", "Bürgercafé", "Bürger-Café", "Bürger-Cafe", "Bürgerbeteiligungsabend","Bürgerforum", "Bürger-Forum", "Bürgergipfel", "Bürgerversammlung", "Bürgerkonferenz", "Bürgerinnen Forum", "Bürgerforen","Bürgergutachten","Bürgerhaushalt", "Kiezfonds", "Schülerhaushalt", "Bürgerbudget","Bürgerinnen Rat", "Bürger Rat", "Bürgerrat", "Bürgerräte" , "Bürgerinnenrat", "Bürgerinnen-Rat", "Bürger-Rat", "minipublic", "Mini-Publics", "Mini-Public", "Minipublics","Bürgertisch", "Bürgerstammtisch", "Bürgergespräch","Deliberation", "deliberativ", "Deliberative Mapping", "Deliberative Polling","Demokratiewerkstatt", "Demokratie Werkstatt","Dialog", "dialogorientiert","Dialogverfahren",  "Dialogangebot","Diskussionsveranstaltung", "Diskussionsrunde", "Diskussionsabend", "Einwohnerantrag", "Bürgerantrag","Einwohnerkonferenz", "Anwohnerkonferenz", "Einwohnerbeteiligung", "Anwohnerbeteiligung", "Einwohnerversammlung", "Anwohnerversammlung", "Nachbarschaftsgespräche","Flüchtlingsdialog", "Coronadialog","Fokusgruppe", "Fishbowl", "Dynamic Facilitation", "Aktivierende Befragung", "frühe Öffentlichkeitsbeteiligung", "Anhörung", "Öffentlichkeitsbeteiligung", "Erörterungstermin", "Informationsveranstaltung", "Bürgerinformation", "Infoabend", "Informationsrunde", "Informationsabend", "Jugendgemeinderat", "Jugendparlament", "Kinderparlament", "Kindergemeinderat", "Jugendbeteiligung", "Jugendforum", "Kinderforum", "Jugendbeirat", "Achterrat", "8er-Rat", "Konsensuskonferenz", "Konsensus-Konferenz", "Konsensorientierte Abstimmung", "Konsensorientierte Abstimmungsverfahren", "Konsultation", "Mitwirkung", "Mitbestimmung", "Koproduktion", "Leitbild","Masterplan", "Leitlinien", "Mediation", "Schlichtung", "Konfliktlösung", "Konfliktlösungskonferenz", "Faktenklärung", "Meinungsumfrage", "Umfrage", "Bürgerumfrage", "Bürgerbefragung", "Bürgerpanel", "Vorschlagswesen", "Online-Beteiligung", "Online-Dialog", "Online-Konsultation", "E-Konsultation", "E-Panel", "Open Space Konferenz", "Open Space", "Open-Space-Konferenz", "Ortsbegehung", "Stadtteilspaziergang", "Stadtteil-Spaziergang", "Ortstermin", "Ortsbegang", "Partizipation", "partizipativ", "Partizipationsangebot", "Planungszelle", "Planungswerkstatt", "Planungsworkshop", "Runder Tisch", "Stadtteilforum", "Stadtteilkonferenz", "Werkstatt", "Workshop", "Perspektivenwerkstatt", "Kompetenzwerkstatt", "Strategiewerkstatt", "Bilanzwerkstatt", "Themenwerkstatt", "Bürgerwerkstatt", "World Cafe", "World-Cafe", "Worldcafe", "Zukunftskonferenz", "Zukunftswerkstatt")
+suchvektor <- paste0(suchvektor, collapse = "|")
+
+
+verfahren <- str_extract_all(df$preprocessed_text, suchvektor)
+verfahren <- unlist(lapply(verfahren,paste0, collapse = ", "))
+df <- data.frame(df, verfahren)
+head(df)
+
+
+df$anzahl <- str_count(df$verfahren, suchvektor)
+
+df2 <- df %>% 
+  group_by(pub_datum) %>%
+  summarise(total = sum(anzahl))
+
+best <- df2[which.max(df2$total), ]
+best$total 
+dummy <- str_detect(df$parsed_text, regex(suchvektor, ignore_case = T))
+length(dummy[dummy == TRUE])
+
+chunk <- parteibezeichnungen_normalisieren (df, dparteien)
+
+chunk <- parteinennungen_zuspielen(df, dparteien)
+
+df
+
+
+
+
+
+
+
+#############
+
+library(quanteda)
+library(quanteda.textplots)
+library(quanteda.textstats)
+library(readr)
+library(readtext)
+library(SentimentAnalysis)
+library(tidyverse)
+library(quanteda.dictionaries)
+library(corpustools)
+library(stringi)
+library(RColorBrewer)
+library(quanteda.dictionaries)
+library(quanteda.sentiment)
+library(lubridate)
+library(ggplot2)
+
+
+class(cps)
+head(cps)
+
+
+#Create a dtm
+
+dtm = cps %>% tokens %>% dfm()
+dtm
+class(dtm)
+
+#preprocessing
+dtm = dfm(cps, remove=stopwords("de"), remove_punct=T, remove_symbols=T, remove_url=T)
+dtm
+
+
+textplot_wordcloud(dtm, max_words = 50)     ## top 50 (most frequent) words
+textplot_wordcloud(dtm, max_words = 30, color = c('blue','pink')) ## change colors
+textstat_frequency(dtm, n = 10)   
+
+
+head(dtm)
+docvars(dtm)
+
+
+#Ort datum dyade wann wo welches projekt
+
+
+## Dyaden 
+
+
+dyaden <- dbReadTable(con, "ort_datum_dyaden")
+dyaden
+
+# suchen nach Hardheim       082255001032 20090402:20140401 082255001032_1
+# um einen subcorpus daraus zu erstellen
+
+docvars(dtm)
+dtm$pub_datum
+class(dtm$pub_datum)
+
+
+
+#datrange in date 
+
+
+dyaden <- dyaden %>% mutate(anfang = str_extract(daterange, "[:digit:]+"),
+                            anfang = as.Date(anfang, format = "%Y%m%d"),
+                            ende = str_extract(daterange, "[:digit:]+$"),
+                            ende = as.Date(ende, format = "%Y%m%d"), 
+                            zeitraum = interval(anfang, ende))
+
+dyaden
+
+# erst Text auswählen also sätze, die in diesem Bereich liegen von Regionalschlüssel und in dem Zeitraum liegen 
+
+# die eigentlich unmögliche lösung 
+#vorkommen zählen und dann das nehmen was am häufigsten vorkommt 
+#geht aber nur auf textebene und nicht auf satzebene
+
+
+#daaat verfahren
+
+#### Datum funktion erstllen 
+
+dat_verfahren <- function(txt) { #txt bedeutet Input ist ein Korpus wie corpus$parsed_text
+  
+  # Der Text wird in einen Vektor gepackt
+  txt = c(txt)
+  
+  #1. Datum herausziehen und als Datum formatieren
+  datum <- unlist(str_extract_all(txt, "\\d{4}\\-\\d{2}\\-\\d{2}"))
+  datum <- as.Date(datum, format = "%Y-%m-%d")
+  
+  # Datum und Text werden in ein Dataframe gepackt  
+  df <- data.frame(datum, txt)
+  
+  
+  #2. Verfahren werden aus dem Text herausgezogen
+  # Pro Zeitungsartikel können verschiedene Verfahren mehrmals erwähnt werden
+  # Wenn man dies nicht will muss man die Funktion unique() verwenden
+  verfahren <- str_extract_all(df$txt, suchvektor)
+  
+  # Die Verfahren befinden sich in einem Vektor und werden hier herauskopiert
+  verfahren <- unlist(lapply(verfahren,paste0, collapse = ", "))
+  
+  df <- data.frame(df, verfahren)
+  
+  
+  #3. Verfahren-Strings werden gezählt
+  df$anzahl <- str_count(df$verfahren, suchvektor) 
+  
+  #df$anzahl <- str_count(df$txt, suchvektor) 
+  # ^ Der Zweite Schritt kann wegfallen, wenn man gleich so vorgeht und die Verfahren im Text zählt.
+  # Die Übersichtlichkeit kann dadurch jedoch verloren gehen.
+  
+  #4. Beteiligungsverfahren zusammen zählen pro Datum
+  
+  df <- df %>% 
+    # Daten werden nach Datum gruppiert
+    group_by(datum) %>% 
+    # Die Anzahl der Verfahren wird nach Datum zusammengezählt
+    summarise(total = sum(anzahl))
+  #5. Datum mit den meisten Verfahren wird ausgegeben
+  return(df[which.max(df$total), ])
+  
+}
+
+
+
+####
+# hier wird auf jede einzele reihe von dyaden angewandt .
+# 1. hier wird ein rgeionalschlüssel rausgezogen aus dyaden rausgezogen
+# zeitraum wird rausgezogen
+# sucorpus erstellen, der aus texte im zeitraum ist 
+#filter -> rs aus dyade der richtige?
+#liegt das datum in dem zeitraum oder nicht ?
+library(lubridate)
+
+
+#datefunktion auf den dataframe anwenden
+
+datum_auslesen(df$parsed_text)
+df$pub_datum
+
+
+
+verf_dat <-  lapply(1:nrow(dyaden), function(x){
+  rs <- dyaden$regionalschluessel[x]
+  zeit <- dyaden$zeitraum[x]
+  sub_corp <- df %>% filter(RS == rs &  pub_datum %within% zeit)
+  if(nrow(sub_corp) == 0) return(NA_Date_) #bei 0 dann NA lol
+  verf_dat <- dat_verfahren(sub_corp$parsed_text) # wenn nix dann NA
+  if(verf_dat$total == 0) return(NA_Date_) #wenn er was findet dann sage er mir das DATUM !!!
+  else return(verf_dat$datum) 
+}) %>% do.call("c", .)
+dyaden$verf_dat <- verf_dat 
+sum(!dyaden$regionalschluessel %in% corpus$RS)
+sum(is.na(dyaden$verf_dat))
+
+
+str(df)
+docvars(cp)
+
+#wow it worked
+
+#zwei sub sub corpus einer vor dem datum und einer danach
+#funktioniert noch nicht
+
+verf_dat <-  lapply(1:nrow(dyaden), function(x){
+  rs <- dyaden$regionalschluessel[x]
+  zeit <- dyaden$zeitraum[x]
+  sub_corp <- df %>% filter(RS == rs &  pub_datum %within% zeit)
+  if(nrow(sub_corp) == 0) return(NA_Date_) #bei 0 dann NA lol
+  verf_dat <- dat_verfahren(sub_corp$parsed_text) # wenn nix dann NA
+  if(verf_dat$total == 0) return(NA_Date_) #wenn er was findet dann sage er mir das DATUM !!!
+  else return(verf_dat$datum) 
+}) %>% do.call("c", .)
+dyaden$verf_dat <- verf_dat 
+sum(!dyaden$regionalschluessel %in% corpus$RS)
+sum(is.na(dyaden$verf_dat))
+
+
+#Sentiment Anlysis auf jeden Satz
+# die und die sätze mit dem sentiment gehöhren zu dem zeitabschnitt
+# durschnittlicher sentimentscore pro zeitraum 
+#sentiment analysis mit dyaden zusammenführen und dann subcorpus und dann differenz ausrechen
+
+'''
